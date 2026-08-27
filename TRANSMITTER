@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+High-Accuracy Fall Detection System using MediaPipe Pose
+Optimized for maximum detection accuracy
+
+MediaPipe provides 33 precise body landmarks - better than YOLO for fall detection!
+YOLO is only for general object detection, not pose estimation.
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+from collections import deque
+from datetime import datetime
+import math
+
+# -------------------------
+# Enhanced FallDetector class with improved accuracy
+# -------------------------
+class FallDetector:
+    def __init__(self):
+        """Initialize MediaPipe Pose with optimal settings for accuracy"""
+        self.mp_pose = mp.solutions.pose
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        
+        # Use model_complexity=2 for MAXIMUM accuracy
+        # Set to 1 for balance, or 0 for speed (if needed)
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=2,  # 0=lite, 1=full, 2=heavy (most accurate)
+            smooth_landmarks=True,  # Temporal smoothing for stability
+            enable_segmentation=False,  # Don't need segmentation
+            smooth_segmentation=False,
+            min_detection_confidence=0.5,  # Detection threshold
+            min_tracking_confidence=0.5    # Tracking threshold
+        )
+
+        # Enhanced fall detection parameters
+        self.fall_threshold_angle = 60  # degrees from vertical
+        self.ground_duration_threshold = 3.0  # seconds to confirm fall
+        self.recovery_threshold = 1.0  # seconds upright to confirm recovery
+        
+        # Multi-criteria detection for better accuracy
+        self.use_multi_criteria = True
+        self.height_threshold = 0.6  # Normalized height threshold
+        self.aspect_ratio_threshold = 1.3  # Width/height ratio when lying
+        
+        # State tracking
+        self.alert_triggered = False
+        self.on_ground_time = None
+        self.upright_time = None
+        self.last_alert_time = 0
+        
+        # Enhanced history for better smoothing
+        self.angle_history = deque(maxlen=15)  # Increased for smoother results
+        self.position_history = deque(maxlen=30)
+        self.velocity_history = deque(maxlen=10)
+        self.aspect_ratio_history = deque(maxlen=10)
+        
+        # Calibration for personalized thresholds
+        self.standing_height = None
+        self.calibration_samples = []
+        self.is_calibrated = False
+        
+        # Statistics
+        self.total_frames = 0
+        self.fall_detections = 0
+        self.false_positive_resets = 0
+        
+        print("✓ High-Accuracy FallDetector initialized")
+        print(f"  Model complexity: 2 (Maximum accuracy)")
+        print(f"  Fall angle threshold: {self.fall_threshold_angle}°")
+        print(f"  Alert delay: {self.ground_duration_threshold}s")
+        print(f"  Multi-criteria detection: {'ON' if self.use_multi_criteria else 'OFF'}")
+
+    def calibrate(self, landmarks):
+        """
+        Calibrate standing height for personalized detection
+        Call this when person is standing upright
+        """
+        if self.is_calibrated:
+            return
+        
+        # Get hip and shoulder heights
+        left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value]
+        right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
+        
+        avg_shoulder_y = (left_shoulder.y + right_shoulder.y) / 2
+        avg_hip_y = (left_hip.y + right_hip.y) / 2
+        avg_y = (avg_shoulder_y + avg_hip_y) / 2
+        
+        self.calibration_samples.append(avg_y)
+        
+        if len(self.calibration_samples) >= 30:
+            self.standing_height = np.median(self.calibration_samples)
+            self.is_calibrated = True
+            print(f"✓ Calibrated! Standing height: {self.standing_height:.3f}")
+            print("  System ready for accurate fall detection")
+
+    def calculate_body_angle(self, landmarks):
+        """
+        Calculate body angle from vertical using shoulder-hip line
+        Returns angle in degrees and y-positions
+        """
+        # Get shoulder landmarks
+        left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        
+        # Get hip landmarks
+        left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value]
+        right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
+
+        # Calculate midpoints
+        shoulder_mid_x = (left_shoulder.x + right_shoulder.x) / 2
+        shoulder_mid_y = (left_shoulder.y + right_shoulder.y) / 2
+        hip_mid_x = (left_hip.x + right_hip.x) / 2
+        hip_mid_y = (left_hip.y + right_hip.y) / 2
+
+        # Calculate angle from vertical
+        dx = shoulder_mid_x - hip_mid_x
+        dy = shoulder_mid_y - hip_mid_y
+        
+        # Angle from vertical (0° = upright, 90° = horizontal)
+        angle = abs(np.degrees(np.arctan2(dx, dy)))
+        
+        return angle, (shoulder_mid_y, hip_mid_y)
+    
+    def calculate_body_aspect_ratio(self, landmarks):
+        """
+        Calculate body aspect ratio (width/height)
+        When lying down, width > height
+        """
+        # Get all major body points
+        nose = landmarks[self.mp_pose.PoseLandmark.NOSE.value]
+        left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value]
+        right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
+        left_ankle = landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE.value]
+        right_ankle = landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE.value]
+        
+        # Calculate bounding box
+        all_x = [nose.x, left_shoulder.x, right_shoulder.x, left_hip.x, 
+                right_hip.x, left_ankle.x, right_ankle.x]
+        all_y = [nose.y, left_shoulder.y, right_shoulder.y, left_hip.y, 
+                right_hip.y, left_ankle.y, right_ankle.y]
+        
+        width = max(all_x) - min(all_x)
+        height = max(all_y) - min(all_y)
+        
+        aspect_ratio = width / (height + 1e-6)
+        
+        return aspect_ratio
+    
+    def calculate_vertical_velocity(self):
+        """
+        Calculate vertical velocity to detect sudden falls
+        """
+        if len(self.position_history) < 2:
+            return 0.0
+        
+        recent = list(self.position_history)[-5:]
+        if len(recent) < 2:
+            return 0.0
+        
+        # Calculate average velocity
+        velocities = []
+        for i in range(1, len(recent)):
+            dy = recent[i] - recent[i-1]
+            velocities.append(dy)
+        
+        return np.mean(velocities) if velocities else 0.0
+    
+    def calculate_stability(self):
+        """
+        Calculate position stability (low variance = stable/fallen)
+        """
+        if len(self.position_history) < 5:
+            return 1.0
+        
+        recent = list(self.position_history)[-10:]
+        return np.var(recent)
+
+    def detect_fall(self, landmarks, image_height):
+        """
+        Multi-criteria fall detection with enhanced accuracy
+        Uses multiple indicators for robust detection
+        """
+        if landmarks is None:
+            return None, "No person detected"
+        
+        self.total_frames += 1
+        
+        # Calibrate if needed
+        if not self.is_calibrated:
+            self.calibrate(landmarks)
+            return {
+                'status': f"Calibrating... {len(self.calibration_samples)}/30",
+                'angle': 0,
+                'alert': False,
+                'is_horizontal': False,
+                'is_low': False,
+                'calibrating': True
+            }, None
+
+        # Calculate all metrics
+        angle, (shoulder_y, hip_y) = self.calculate_body_angle(landmarks)
+        aspect_ratio = self.calculate_body_aspect_ratio(landmarks)
+        
+        # Update histories
+        self.angle_history.append(angle)
+        self.aspect_ratio_history.append(aspect_ratio)
+        
+        # Smooth angle with moving average
+        avg_angle = sum(self.angle_history) / len(self.angle_history)
+        avg_aspect_ratio = sum(self.aspect_ratio_history) / len(self.aspect_ratio_history)
+
+        # Track vertical position (higher value = lower on screen)
+        avg_y_position = (shoulder_y + hip_y) / 2
+        self.position_history.append(avg_y_position)
+        
+        # Calculate derived metrics
+        velocity = self.calculate_vertical_velocity()
+        self.velocity_history.append(velocity)
+        stability = self.calculate_stability()
+        
+        # Normalized height compared to calibrated standing height
+        height_ratio = avg_y_position / self.standing_height if self.standing_height else avg_y_position
+
+        current_time = time.time()
+        
+        # ===== MULTI-CRITERIA FALL DETECTION =====
+        criteria_score = 0
+        criteria_details = {}
+        
+        # Criterion 1: Body angle (most important)
+        is_horizontal = avg_angle > self.fall_threshold_angle
+        criteria_details['angle'] = is_horizontal
+        if is_horizontal:
+            criteria_score += 2  # Weight: 2
+        
+        # Criterion 2: Low position
+        is_low = height_ratio > 1.2  # Person is lower than normal standing
+        criteria_details['position'] = is_low
+        if is_low:
+            criteria_score += 2  # Weight: 2
+        
+        # Criterion 3: Aspect ratio (lying down = wider than tall)
+        is_lying = avg_aspect_ratio > self.aspect_ratio_threshold
+        criteria_details['aspect_ratio'] = is_lying
+        if is_lying:
+            criteria_score += 1  # Weight: 1
+        
+        # Criterion 4: Stability (not moving around)
+        is_stable = stability < 0.0005
+        criteria_details['stable'] = is_stable
+        if is_stable:
+            criteria_score += 1  # Weight: 1
+        
+        # Criterion 5: Sudden drop (rapid downward movement)
+        sudden_drop = velocity > 0.05
+        criteria_details['sudden_drop'] = sudden_drop
+        if sudden_drop:
+            criteria_score += 1  # Weight: 1
+        
+        # Total possible score: 7
+        # Fall detected if score >= 4 (configurable)
+        fall_confidence = criteria_score / 7.0
+        is_fall = criteria_score >= 4
+
+        status = "Standing"
+        alert = False
+
+        if is_fall:
+            # Fall detected - track duration
+            if self.on_ground_time is None:
+                self.on_ground_time = current_time
+                self.fall_detections += 1
+                status = "⚠️ Fall Detected!"
+                print(f"\n⚠️  Fall detected at {datetime.now().strftime('%H:%M:%S')}")
+                print(f"   Criteria score: {criteria_score}/7 ({fall_confidence:.1%})")
+                print(f"   Angle: {avg_angle:.1f}° | Aspect: {avg_aspect_ratio:.2f} | Position: {height_ratio:.2f}")
+            else:
+                # Person has been on ground for some time
+                time_on_ground = current_time - self.on_ground_time
+                status = f"⚠️ On Ground: {time_on_ground:.1f}s"
+                
+                # Trigger alert if on ground too long
+                if time_on_ground > self.ground_duration_threshold and not self.alert_triggered:
+                    alert = True
+                    self.alert_triggered = True
+                    status = f"🚨 FALL ALERT! Person on ground {time_on_ground:.1f}s!"
+                    print(f"\n🚨 ALERT: Person needs help! On ground for {time_on_ground:.1f}s")
+            
+            # Reset upright timer
+            self.upright_time = None
+        else:
+            # Not in fall position
+            if self.on_ground_time is not None:
+                # Person was on ground but now getting up
+                if self.upright_time is None:
+                    self.upright_time = current_time
+                else:
+                    upright_duration = current_time - self.upright_time
+                    if upright_duration > self.recovery_threshold:
+                        # Confirmed recovery
+                        time_was_down = current_time - self.on_ground_time
+                        print(f"✓ Person recovered! Was down for {time_was_down:.1f}s")
+                        self.on_ground_time = None
+                        self.upright_time = None
+                        self.alert_triggered = False
+                        self.false_positive_resets += 1
+            else:
+                self.upright_time = None
+            
+            # Determine status based on position
+            if is_horizontal and not is_low:
+                status = "Bending/Crouching"
+            elif is_low and not is_horizontal:
+                status = "Sitting"
+            else:
+                status = "Standing"
+
+        return {
+            'angle': avg_angle,
+            'aspect_ratio': avg_aspect_ratio,
+            'height_ratio': height_ratio,
+            'velocity': velocity,
+            'stability': stability,
+            'criteria_score': criteria_score,
+            'confidence': fall_confidence,
+            'status': status,
+            'alert': alert,
+            'is_horizontal': is_horizontal,
+            'is_low': is_low,
+            'is_lying': is_lying,
+            'is_stable': is_stable,
+            'criteria_details': criteria_details,
+            'calibrating': False
+        }, None
+
+    def draw_info(self, frame, result):
+        """Draw comprehensive fall detection information"""
+        if result is None:
+            return
+        
+        height, width = frame.shape[:2]
+        
+        # Semi-transparent overlay for text background
+        overlay = frame.copy()
+        info_height = 200 if not result.get('calibrating', False) else 80
+        cv2.rectangle(overlay, (10, 10), (width - 10, info_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Determine status color
+        status = result['status']
+        if result.get('calibrating', False):
+            color = (0, 255, 255)  # Yellow for calibrating
+        elif result.get('alert', False):
+            color = (0, 0, 255)  # Red for alert
+        elif result.get('is_horizontal', False):
+            color = (0, 165, 255)  # Orange for potential fall
+        else:
+            color = (0, 255, 0)  # Green for normal
+
+        # Draw status
+        cv2.putText(frame, f"Status: {status}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        if not result.get('calibrating', False):
+            # Draw detailed metrics
+            cv2.putText(frame, f"Angle: {result['angle']:.1f}° (threshold: {self.fall_threshold_angle}°)", 
+                       (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            cv2.putText(frame, f"Aspect Ratio: {result['aspect_ratio']:.2f}", 
+                       (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            cv2.putText(frame, f"Height Ratio: {result['height_ratio']:.2f}", 
+                       (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            cv2.putText(frame, f"Confidence: {result['confidence']:.1%} ({result['criteria_score']}/7)", 
+                       (20, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            cv2.putText(frame, f"Stability: {result['stability']:.5f}", 
+                       (20, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Warning indicator
+        if result.get('is_horizontal', False) or result.get('alert', False):
+            cv2.circle(frame, (width - 50, 50), 30, color, -1)
+            cv2.putText(frame, "!", (width - 60, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+
+    def draw_statistics(self, frame):
+        """Draw detection statistics"""
+        height, width = frame.shape[:2]
+        
+        stats_y = height - 80
+        cv2.putText(frame, f"Total Frames: {self.total_frames}", 
+                   (10, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(frame, f"Fall Detections: {self.fall_detections}", 
+                   (10, stats_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(frame, f"Recoveries: {self.false_positive_resets}", 
+                   (10, stats_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+    def reset_alert(self):
+        """Reset fall alert state"""
+        self.alert_triggered = False
+        self.on_ground_time = None
+        self.upright_time = None
+        print("✓ Alert reset")
+
+    def adjust_threshold(self, delta):
+        """Adjust fall detection angle threshold"""
+        self.fall_threshold_angle = max(30, min(90, self.fall_threshold_angle + delta))
+        print(f"Threshold adjusted to {self.fall_threshold_angle}°")
+    
+    def recalibrate(self):
+        """Reset calibration"""
+        self.is_calibrated = False
+        self.calibration_samples = []
+        self.standing_height = None
+        print("🔄 Recalibrating... Please stand upright")
+
+
+# -------------------------
+# Main script
+# -------------------------
+def main():
+    print("\n" + "="*60)
+    print("HIGH-ACCURACY FALL DETECTION SYSTEM")
+    print("MediaPipe Pose - Maximum Accuracy Mode")
+    print("="*60 + "\n")
+    
+    # Initialize Fall Detector
+    fall_detector = FallDetector()
+
+    # Initialize camera
+    print("Initializing camera...")
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    if not cap.isOpened():
+        print("❌ Error: Could not open camera")
+        return
+    
+    print("✓ Camera opened successfully\n")
+    
+    print("="*60)
+    print("CONTROLS:")
+    print("  Q     - Quit")
+    print("  +/=   - Increase angle threshold")
+    print("  -/_   - Decrease angle threshold")
+    print("  R     - Reset fall alert")
+    print("  C     - Recalibrate standing height")
+    print("  S     - Save screenshot")
+    print("  H     - Toggle help display")
+    print("="*60)
+    print("\n📋 Stand upright for 3 seconds to calibrate...\n")
+
+    fps_list = deque(maxlen=30)
+    frame_count = 0
+    show_help = False
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame")
+                break
+
+            start_time = time.time()
+            frame_count += 1
+
+            # MediaPipe fall detection
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False
+            pose_results = fall_detector.pose.process(image_rgb)
+            image_rgb.flags.writeable = True
+            frame = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+            # Draw pose landmarks and detect fall
+            if pose_results.pose_landmarks:
+                # Draw skeleton
+                fall_detector.mp_drawing.draw_landmarks(
+                    frame,
+                    pose_results.pose_landmarks,
+                    fall_detector.mp_pose.POSE_CONNECTIONS,
+                    landmark_drawing_spec=fall_detector.mp_drawing_styles.get_default_pose_landmarks_style()
+                )
+
+                # Detect fall
+                fall_result, error = fall_detector.detect_fall(
+                    pose_results.pose_landmarks.landmark,
+                    frame.shape[0]
+                )
+                
+                if fall_result:
+                    fall_detector.draw_info(frame, fall_result)
+                    fall_detector.draw_statistics(frame)
+                    
+                    # Print alert to console
+                    if fall_result.get('alert', False):
+                        print(f"\n🚨 ALERT: {fall_result['status']}")
+            else:
+                # No person detected
+                cv2.putText(frame, "No person detected", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(frame, "Please move into view", (20, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            # Calculate and display FPS
+            fps = 1.0 / (time.time() - start_time)
+            fps_list.append(fps)
+            avg_fps = sum(fps_list) / len(fps_list)
+            
+            fps_color = (0, 255, 0) if avg_fps > 15 else (0, 165, 255) if avg_fps > 10 else (0, 0, 255)
+            cv2.putText(frame, f"FPS: {avg_fps:.1f}", (frame.shape[1] - 120, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, fps_color, 2)
+            
+            # Display mode indicator
+            cv2.putText(frame, "High Accuracy Mode", (frame.shape[1] - 220, frame.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # Show frame
+            cv2.imshow("Fall Detection - High Accuracy", frame)
+
+            # Keyboard controls
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q'):
+                print("\nQuitting...")
+                break
+            elif key == ord('+') or key == ord('='):
+                fall_detector.adjust_threshold(5)
+            elif key == ord('-') or key == ord('_'):
+                fall_detector.adjust_threshold(-5)
+            elif key == ord('r'):
+                fall_detector.reset_alert()
+            elif key == ord('c'):
+                fall_detector.recalibrate()
+            elif key == ord('s'):
+                filename = f"fall_detection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                cv2.imwrite(filename, frame)
+                print(f"📷 Screenshot saved: {filename}")
+            elif key == ord('h'):
+                show_help = not show_help
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+    
+    finally:
+        # Cleanup
+        cap.release()
+        cv2.destroyAllWindows()
+        fall_detector.pose.close()
+        
+        # Print final statistics
+        print("\n" + "="*60)
+        print("FINAL STATISTICS")
+        print("="*60)
+        print(f"Total frames processed: {fall_detector.total_frames}")
+        print(f"Fall detections: {fall_detector.fall_detections}")
+        print(f"Recoveries: {fall_detector.false_positive_resets}")
+        if len(fps_list) > 0:
+            print(f"Average FPS: {sum(fps_list)/len(fps_list):.2f}")
+        print("="*60)
+        print("✓ Cleanup complete")
+
+
+if __name__ == "__main__":
+    main()
