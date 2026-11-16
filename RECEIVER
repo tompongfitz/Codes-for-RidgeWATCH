@@ -1,0 +1,162 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h> 
+
+// --- LoRa (SX1278) Pins for ESP32 ---
+#define LORA_SS    5   
+#define LORA_RST   14
+#define LORA_DIO0  26  
+
+// --- OLED Display Settings (1.3" SH1106) ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1 
+#define OLED_ADDRESS  0x3C 
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Buzzer Settings ---
+#define BUZZER_PIN 25
+
+// --- Timing Variables ---
+unsigned long alertStartTime = 0;
+const unsigned long ALERT_DURATION = 10000; 
+bool isAlertActive = false;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Initialize 1.3" SH1106 OLED
+  if(!display.begin(OLED_ADDRESS, true)) {
+    Serial.println(F("SH1106 OLED allocation failed"));
+    for(;;); 
+  }
+  
+  // 1. Show the custom Welcome Screen
+  drawWelcomeScreen();
+
+  // 2. Initialize LoRa
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  
+  if (!LoRa.begin(433E6)) {
+    Serial.println("Starting LoRa failed!");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("LoRa Failed!");
+    display.display();
+    while (1);
+  }
+  
+  // --- SYNCHRONIZED RADIO SETTINGS ---
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setSpreadingFactor(7);
+  LoRa.setCodingRate4(5);
+  // -----------------------------------
+  
+  LoRa.setTxPower(20); 
+  Serial.println("LoRa Receiver Ready.");
+  
+  // 3. Move to the main monitoring screen
+  drawNormalStatus();
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String incoming = "";
+    while (LoRa.available()) {
+      incoming += (char)LoRa.read();
+    }
+    
+    Serial.print("Received packet: ");
+    Serial.println(incoming);
+
+    if (incoming.indexOf("Accident Detected") != -1) {
+      triggerAlert();
+    }
+  }
+
+  if (isAlertActive && (millis() - alertStartTime >= ALERT_DURATION)) {
+    isAlertActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    drawNormalStatus();
+    Serial.println("System returned to normal monitoring.");
+  }
+}
+
+// --- Display Functions ---
+
+void drawWelcomeScreen() {
+  display.clearDisplay();
+  
+  // Draw a sleek rounded border
+  display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 4, SH110X_WHITE);
+  
+  // Main Title (Perfectly centered for 10 characters at Size 2)
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(2);
+  display.setCursor(4, 12);
+  display.print("RidgeWATCH");
+  
+  // Subtitle (Perfectly centered for 16 characters at Size 1)
+  display.setTextSize(1);
+  display.setCursor(16, 32);
+  display.print("LaNorte Autobots");
+  
+  display.display();
+  delay(1000); // Pause so the user can read the text
+  
+  // Animated Loading Bar
+  display.drawRect(24, 48, 80, 8, SH110X_WHITE); // Loading bar outline
+  
+  for(int i = 0; i <= 76; i+=4) {
+    display.fillRect(26, 50, i, 4, SH110X_WHITE); // Fill the bar gradually
+    display.display();
+    delay(50); // Speed of the loading animation
+  }
+  
+  delay(500); // Brief pause at 100% before switching screens
+}
+
+void triggerAlert() {
+  isAlertActive = true;
+  alertStartTime = millis();
+  
+  digitalWrite(BUZZER_PIN, HIGH); 
+  
+  display.clearDisplay();
+  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SH110X_WHITE);
+  
+  display.setTextSize(2);
+  display.setCursor(15, 15);
+  display.println("ACCIDENT");
+  
+  display.setTextSize(2);
+  display.setCursor(15, 35);
+  display.println("DETECTED!");
+  
+  display.display();
+}
+
+void drawNormalStatus() {
+  display.clearDisplay();
+  
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("RidgeWATCH System");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SH110X_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 25);
+  display.println("Status: Monitoring");
+  
+  display.setCursor(0, 45);
+  display.println("Signal: Ready");
+  
+  display.display();
+}
